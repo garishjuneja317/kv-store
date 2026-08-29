@@ -1,0 +1,8 @@
+# Zero-Dependency Hackathon — Project Manifest
+track       = "D"
+language    = "Java"
+jdk_version = "25"
+entry_point = "src/Main.java"
+test_runner = "tests/StorageEngineTest.java"
+
+pitch = "A crash-safe, WAL-backed embedded KV store in pure Java 25 — zero dependencies, O(1) reads, atomic compaction, and concurrent read/write support, all in under 600 lines of standard-library code."
