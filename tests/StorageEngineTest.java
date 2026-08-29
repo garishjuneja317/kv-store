@@ -23,6 +23,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>Recovery Ordering — last-write wins on repeated keys</li>
  *   <li>Large Value — multi-KiB values survive round-trip</li>
  *   <li>Stats Reporting — stats() returns a non-empty string with key count</li>
+ *   <li>TTL: key not yet expired — value still accessible</li>
+ *   <li>TTL: key expired on GET — lazy eviction returns empty</li>
+ *   <li>TTL: persistence across reopen — TTL survives WAL replay</li>
+ *   <li>TTL: compaction excludes expired keys</li>
+ *   <li>TTL: overwrite clears previous TTL</li>
  * </ol>
  */
 public class StorageEngineTest {
@@ -86,6 +91,11 @@ public class StorageEngineTest {
         try { Files.deleteIfExists(p); } catch (IOException ignored) {}
     }
 
+    /** Sleeps for the given number of milliseconds, ignoring interruption. */
+    static void sleepMs(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
     // -------------------------------------------------------------------------
     // main
     // -------------------------------------------------------------------------
@@ -109,6 +119,13 @@ public class StorageEngineTest {
         testConcurrentWrites();
         testConcurrentReads();
 
+        // TTL tests
+        testTtlNotYetExpired();
+        testTtlExpiredOnGet();
+        testTtlPersistenceAcrossReopen();
+        testTtlCompactionExcludesExpired();
+        testTtlOverwriteClearsTtl();
+
         // -------------------------------------------------------------------------
         // Summary
         // -------------------------------------------------------------------------
@@ -125,7 +142,7 @@ public class StorageEngineTest {
     }
 
     // =========================================================================
-    // Test methods
+    // Test methods — existing
     // =========================================================================
 
     // -------------------------------------------------------------------------
@@ -383,6 +400,8 @@ public class StorageEngineTest {
                 stats.contains("GET  ops"));
             assertTrue("stats() contains DELETE count",
                 stats.contains("DELETE ops"));
+            assertTrue("stats() contains expired purged counter",
+                stats.contains("Expired purged"));
 
         } finally {
             silentDelete(wal);
@@ -485,6 +504,173 @@ public class StorageEngineTest {
             pool.awaitTermination(10, TimeUnit.SECONDS);
 
             assertTrue("All concurrent reads returned correct values", allCorrect);
+
+        } finally {
+            silentDelete(wal);
+        }
+    }
+
+    // =========================================================================
+    // TTL test methods (12–16)
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // 12. TTL: key not yet expired — value is still accessible
+    // -------------------------------------------------------------------------
+    static void testTtlNotYetExpired() throws Exception {
+        System.out.println("\n\u001B[1m[12] TTL: Key Not Yet Expired\u001B[0m");
+        Path wal = tempWal("ttl-live");
+        try (StorageEngine e = new StorageEngine(wal)) {
+
+            e.set("session", "tok-abc", 60L); // 60-second TTL
+            assertEquals("GET immediately after SET-with-TTL returns value",
+                Optional.of("tok-abc"), e.get("session"));
+
+            long remaining = e.ttl("session");
+            assertTrue("TTL returns positive seconds when key is live",
+                remaining > 0 && remaining <= 60);
+
+        } finally {
+            silentDelete(wal);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 13. TTL: key expired on GET — lazy eviction returns empty
+    // -------------------------------------------------------------------------
+    static void testTtlExpiredOnGet() throws Exception {
+        System.out.println("\n\u001B[1m[13] TTL: Key Expired on GET (Lazy Eviction)\u001B[0m");
+        Path wal = tempWal("ttl-expired");
+        try (StorageEngine e = new StorageEngine(wal)) {
+
+            e.set("shortlived", "value", 1L); // 1-second TTL
+
+            // Value should be accessible immediately.
+            assertEquals("GET before expiry returns value",
+                Optional.of("value"), e.get("shortlived"));
+
+            // Wait for expiry: 1 second + 200 ms margin.
+            sleepMs(1_200);
+
+            assertEquals("GET after TTL expiry returns empty",
+                Optional.empty(), e.get("shortlived"));
+
+            long remaining = e.ttl("shortlived");
+            assertEquals("TTL returns -2 after expiry", -2L, remaining);
+
+            // Key must not appear in live count after lazy eviction.
+            assertEquals("Live key count is 0 after expiry",
+                0, e.liveKeyCount());
+
+        } finally {
+            silentDelete(wal);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 14. TTL: persistence across reopen — WAL X record survives replay
+    // -------------------------------------------------------------------------
+    static void testTtlPersistenceAcrossReopen() throws Exception {
+        System.out.println("\n\u001B[1m[14] TTL: Persistence Across WAL Reopen\u001B[0m");
+        Path wal = tempWal("ttl-persist");
+        try {
+            // Write a key with 10-second TTL and close.
+            try (StorageEngine e = new StorageEngine(wal)) {
+                e.set("durable-ttl", "hello", 10L);
+            }
+
+            // Reopen immediately — key should still be present with remaining TTL.
+            try (StorageEngine e = new StorageEngine(wal)) {
+                assertEquals("TTL key survives WAL replay",
+                    Optional.of("hello"), e.get("durable-ttl"));
+                long remaining = e.ttl("durable-ttl");
+                assertTrue("Remaining TTL after replay is positive and ≤ 10",
+                    remaining > 0 && remaining <= 10);
+            }
+
+            // Write a key that will have expired by the time we reopen.
+            try (StorageEngine e = new StorageEngine(wal)) {
+                e.set("soon-expired", "gone", 1L); // 1 second
+                // Verify it is live now.
+                assertEquals("soon-expired is live before sleep",
+                    Optional.of("gone"), e.get("soon-expired"));
+            }
+
+            // Wait for expiry, then reopen — recovery must skip the expired key.
+            sleepMs(1_300);
+            try (StorageEngine e = new StorageEngine(wal)) {
+                assertEquals("Expired key is NOT loaded on WAL replay",
+                    Optional.empty(), e.get("soon-expired"));
+            }
+
+        } finally {
+            silentDelete(wal);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 15. TTL: compaction excludes expired keys from the rewritten WAL
+    // -------------------------------------------------------------------------
+    static void testTtlCompactionExcludesExpired() throws Exception {
+        System.out.println("\n\u001B[1m[15] TTL: Compaction Excludes Expired Keys\u001B[0m");
+        Path wal = tempWal("ttl-compact");
+        try (StorageEngine e = new StorageEngine(wal)) {
+
+            e.set("permanent", "stays");
+            e.set("temporary", "leaves", 1L); // 1-second TTL
+
+            long sizeBeforeExpiry = Files.size(wal);
+
+            // Wait for TTL to expire.
+            sleepMs(1_300);
+
+            // Compact — must not include the expired key in rewritten WAL.
+            e.compact();
+
+            long sizeAfterCompact = Files.size(wal);
+            assertTrue("WAL shrinks after compact (expired key removed)",
+                sizeAfterCompact < sizeBeforeExpiry);
+
+            assertEquals("Permanent key survives compaction",
+                Optional.of("stays"), e.get("permanent"));
+            assertEquals("Expired key is absent after compaction",
+                Optional.empty(), e.get("temporary"));
+            assertEquals("Live key count after TTL-aware compact",
+                1, e.liveKeyCount());
+
+        } finally {
+            silentDelete(wal);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 16. TTL: overwriting a TTL key with a plain SET clears the TTL
+    // -------------------------------------------------------------------------
+    static void testTtlOverwriteClearsTtl() throws Exception {
+        System.out.println("\n\u001B[1m[16] TTL: Overwrite Clears Previous TTL\u001B[0m");
+        Path wal = tempWal("ttl-overwrite");
+        try (StorageEngine e = new StorageEngine(wal)) {
+
+            // Set with short TTL.
+            e.set("key", "old-value", 2L);
+            assertEquals("Value accessible before overwrite",
+                Optional.of("old-value"), e.get("key"));
+
+            // Overwrite with no TTL.
+            e.set("key", "new-value");
+            assertEquals("Overwritten value is correct",
+                Optional.of("new-value"), e.get("key"));
+
+            // TTL should be cleared (returns -1 for "no TTL").
+            long ttl = e.ttl("key");
+            assertEquals("TTL is cleared after plain SET overwrite", -1L, ttl);
+
+            // Wait longer than the original TTL would have allowed.
+            sleepMs(2_500);
+
+            // Key should still be accessible — no TTL anymore.
+            assertEquals("Key with cleared TTL persists beyond original expiry",
+                Optional.of("new-value"), e.get("key"));
 
         } finally {
             silentDelete(wal);

@@ -11,37 +11,46 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * StorageEngine — a high-performance, embedded key-value store.
+ * StorageEngine — a high-performance, embedded key-value store with optional key expiration (TTL).
  *
  * <h2>Architecture</h2>
  * <pre>
  *   Write Path:  caller → ReadWriteLock (write) → ConcurrentHashMap → WAL append → fsync
- *   Read  Path:  caller → ReadWriteLock (read)  → ConcurrentHashMap (O(1))
+ *   Read  Path:  caller → ReadWriteLock (read)  → ConcurrentHashMap (O(1)) → TTL check
  *   Compact:     ReadWriteLock (write) → scan index → rewrite WAL → swap files
- *   Recovery:    sequential WAL replay → rebuild ConcurrentHashMap in memory
+ *   Recovery:    sequential WAL replay → rebuild ConcurrentHashMap + expiry map in memory
+ *   TTL Purge:   ScheduledExecutorService (virtual thread) → sweep expiry map every second
  * </pre>
  *
  * <h2>WAL Record Format</h2>
  * Each record is a single newline-terminated line:
  * <pre>
- *   SET  → "S|<key-len>|<key>|<value-len>|<value>\n"
- *   DEL  → "D|<key-len>|<key>\n"
+ *   SET (no TTL) → "S|<key-len>|<key>|<value-len>|<value>\n"
+ *   SET (w/ TTL) → "X|<key-len>|<key>|<value-len>|<value>|<expiry-epoch-ms>\n"
+ *   DEL          → "D|<key-len>|<key>\n"
  * </pre>
- * Key and value are stored as raw UTF-8; the length prefix handles embedded
- * newlines, pipes, or any other special bytes in user data.
+ * The {@code X} record type is a strict superset of {@code S}: it carries an additional
+ * absolute expiry timestamp (epoch milliseconds). Old WAL files containing only {@code S}
+ * and {@code D} records are still fully replay-compatible.
+ *
+ * <h2>TTL / Key Expiration</h2>
+ * <ul>
+ *   <li><b>Lazy evaluation:</b> {@link #get} checks the expiry map before returning a value.
+ *       If the TTL has elapsed the key is removed from both the index and the expiry map,
+ *       a tombstone is written to the WAL, and {@link Optional#empty()} is returned.</li>
+ *   <li><b>Active purge:</b> A {@link ScheduledExecutorService} backed by a virtual thread
+ *       sweeps the expiry map every second and removes keys whose TTL has passed.</li>
+ * </ul>
  *
  * <h2>Concurrency Model</h2>
  * A single {@link ReentrantReadWriteLock} guards every mutation ({@code set},
- * {@code delete}, {@code compact}).  Concurrent reads via {@code get} share the
- * read lock and never block each other.  The WAL is flushed and synced inside
+ * {@code delete}, {@code compact}, TTL purge writes).  Concurrent reads via {@code get}
+ * share the read lock and never block each other.  The WAL is flushed and synced inside
  * the write lock so callers always see a consistent view of durable state.
  *
  * <h2>Durability</h2>
  * Every mutating operation flushes the {@link BufferedOutputStream} and calls
  * {@link FileChannel#force(boolean)} (fdatasync) before releasing the lock.
- * Power-loss between the in-memory update and the sync can therefore only lose
- * the very last operation, and recovery will discard any partial trailing
- * record automatically.
  */
 public class StorageEngine implements Closeable {
 
@@ -51,8 +60,11 @@ public class StorageEngine implements Closeable {
 
     private static final Logger LOG = Logger.getLogger(StorageEngine.class.getName());
 
-    /** Record-type byte for a SET entry in the WAL. */
+    /** Record-type byte for a SET entry (no TTL) in the WAL. */
     private static final char OP_SET = 'S';
+
+    /** Record-type byte for a SET entry WITH expiry in the WAL. */
+    private static final char OP_SET_EX = 'X';
 
     /** Record-type byte for a DELETE entry in the WAL. */
     private static final char OP_DEL = 'D';
@@ -68,6 +80,9 @@ public class StorageEngine implements Closeable {
 
     /** Buffer size for the WAL reader during recovery (256 KiB). */
     private static final int READ_BUFFER_BYTES = 256 * 1024;
+
+    /** How often the background TTL purger runs (milliseconds). */
+    private static final long PURGE_INTERVAL_MS = 1_000L;
 
     // -------------------------------------------------------------------------
     // State
@@ -86,6 +101,12 @@ public class StorageEngine implements Closeable {
     private final ConcurrentHashMap<String, String> index = new ConcurrentHashMap<>();
 
     /**
+     * Expiry map: key → absolute expiry timestamp in epoch milliseconds.
+     * Keys present here have a TTL; keys absent have no expiry.
+     */
+    private final ConcurrentHashMap<String, Long> expiry = new ConcurrentHashMap<>();
+
+    /**
      * Guards all mutations.  Multiple readers may hold the read lock
      * simultaneously; any writer holds the write lock exclusively.
      */
@@ -97,6 +118,12 @@ public class StorageEngine implements Closeable {
     /** FileChannel to the WAL, used for fdatasync via {@code force()}. */
     private FileChannel walChannel;
 
+    /** Background scheduler that periodically purges expired keys. */
+    private final ScheduledExecutorService purger;
+
+    /** Set to true when {@link #close()} has been called. */
+    private volatile boolean closed = false;
+
     // -------------------------------------------------------------------------
     // Telemetry counters (lock-free via AtomicLong)
     // -------------------------------------------------------------------------
@@ -106,6 +133,7 @@ public class StorageEngine implements Closeable {
     private final AtomicLong opDeletes     = new AtomicLong();
     private final AtomicLong opCompacts    = new AtomicLong();
     private final AtomicLong recoveredKeys = new AtomicLong();
+    private final AtomicLong opExpired     = new AtomicLong();
 
     // -------------------------------------------------------------------------
     // Constructor / lifecycle
@@ -135,6 +163,16 @@ public class StorageEngine implements Closeable {
         // Open WAL for append.
         openWal();
 
+        // Start background TTL purger on a virtual thread.
+        purger = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = Thread.ofVirtual().unstarted(r);
+            t.setName("kv-ttl-purger");
+            t.setDaemon(true);
+            return t;
+        });
+        purger.scheduleAtFixedRate(this::purgeExpiredKeys,
+            PURGE_INTERVAL_MS, PURGE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+
         LOG.info(String.format(
             "[StorageEngine] ready — walPath=%s, keys=%d (recovered=%d)",
             walPath, index.size(), recoveredKeys.get()));
@@ -155,6 +193,7 @@ public class StorageEngine implements Closeable {
     /**
      * Stores {@code value} under {@code key}, overwriting any previous mapping.
      * The operation is written to the WAL and flushed to disk before returning.
+     * Any existing TTL for the key is cleared.
      *
      * @param key   non-null, non-empty key
      * @param value non-null value (empty string is permitted)
@@ -169,6 +208,38 @@ public class StorageEngine implements Closeable {
         try {
             appendSet(key, value);
             index.put(key, value);
+            expiry.remove(key);   // clear any previous TTL
+            opSets.incrementAndGet();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Stores {@code value} under {@code key} with a time-to-live of {@code ttlSeconds}.
+     * After the TTL elapses the key will be invisible to {@link #get} and will be
+     * removed by the background purger (or lazily on next access).
+     *
+     * @param key        non-null, non-empty key
+     * @param value      non-null value
+     * @param ttlSeconds positive number of seconds until the key expires
+     * @throws IOException              if the WAL write or sync fails
+     * @throws IllegalArgumentException if {@code key} is null/empty or {@code ttlSeconds} ≤ 0
+     */
+    public void set(String key, String value, long ttlSeconds) throws IOException {
+        validateKey(key);
+        Objects.requireNonNull(value, "value must not be null");
+        if (ttlSeconds <= 0) {
+            throw new IllegalArgumentException("ttlSeconds must be positive, got: " + ttlSeconds);
+        }
+
+        long expiryMs = System.currentTimeMillis() + ttlSeconds * 1_000L;
+
+        lock.writeLock().lock();
+        try {
+            appendSetEx(key, value, expiryMs);
+            index.put(key, value);
+            expiry.put(key, expiryMs);
             opSets.incrementAndGet();
         } finally {
             lock.writeLock().unlock();
@@ -177,7 +248,8 @@ public class StorageEngine implements Closeable {
 
     /**
      * Returns the value associated with {@code key}, or {@link Optional#empty()}
-     * if the key does not exist or has been deleted.
+     * if the key does not exist, has been deleted, or its TTL has expired.
+     * Expired keys are lazily evicted on this call.
      *
      * @param key non-null, non-empty key
      * @return an {@link Optional} containing the value, or empty
@@ -187,8 +259,22 @@ public class StorageEngine implements Closeable {
         validateKey(key);
         opGets.incrementAndGet();
 
+        // Fast TTL check without write lock — if already expired, evict lazily.
+        Long expiryMs = expiry.get(key);
+        if (expiryMs != null && System.currentTimeMillis() > expiryMs) {
+            evictExpired(key);
+            return Optional.empty();
+        }
+
         lock.readLock().lock();
         try {
+            // Re-check after acquiring read lock (purger may have removed it).
+            Long exp = expiry.get(key);
+            if (exp != null && System.currentTimeMillis() > exp) {
+                // Cannot write tombstone under read lock; caller will see empty,
+                // and the next purger sweep (within 1 s) will clean it up.
+                return Optional.empty();
+            }
             return Optional.ofNullable(index.get(key));
         } finally {
             lock.readLock().unlock();
@@ -211,6 +297,7 @@ public class StorageEngine implements Closeable {
         try {
             appendDelete(key);
             index.remove(key);
+            expiry.remove(key);
             opDeletes.incrementAndGet();
         } finally {
             lock.writeLock().unlock();
@@ -218,25 +305,23 @@ public class StorageEngine implements Closeable {
     }
 
     /**
-     * Rewrites the WAL to contain only the live (non-deleted, non-overwritten)
-     * key-value pairs, reclaiming disk space consumed by stale entries.
+     * Rewrites the WAL to contain only the live (non-deleted, non-overwritten,
+     * non-expired) key-value pairs, reclaiming disk space consumed by stale entries.
      *
-     * <p>The sequence is:
-     * <ol>
-     *   <li>Acquire the exclusive write lock.</li>
-     *   <li>Snapshot the current in-memory index.</li>
-     *   <li>Write all live pairs to a temporary WAL file.</li>
-     *   <li>Atomically rename the tmp file over the active WAL.</li>
-     *   <li>Re-open the WAL for append.</li>
-     * </ol>
+     * <p>Keys with remaining TTL are compacted using {@code X} records so that
+     * their expiry timestamp survives the rewrite.
      *
      * @throws IOException if any file operation during compaction fails
      */
     public void compact() throws IOException {
         lock.writeLock().lock();
         try {
-            // Snapshot the index under the write lock so no mutations slip in.
-            Map<String, String> snapshot = new HashMap<>(index);
+            // Purge expired keys before snapshotting (don't include them in compacted WAL).
+            purgeExpiredKeysUnderLock();
+
+            // Snapshot the index and expiry maps under the write lock.
+            Map<String, String> snap       = new HashMap<>(index);
+            Map<String, Long>   snapExpiry = new HashMap<>(expiry);
 
             // Close the current WAL writer before we touch the file.
             closeWal();
@@ -246,8 +331,15 @@ public class StorageEngine implements Closeable {
                  BufferedOutputStream bos = new BufferedOutputStream(fos, WRITE_BUFFER_BYTES);
                  FileChannel ch = fos.getChannel()) {
 
-                for (Map.Entry<String, String> entry : snapshot.entrySet()) {
-                    writeSetRecord(bos, entry.getKey(), entry.getValue());
+                for (Map.Entry<String, String> entry : snap.entrySet()) {
+                    String key   = entry.getKey();
+                    String value = entry.getValue();
+                    Long exp = snapExpiry.get(key);
+                    if (exp != null) {
+                        writeSetExRecord(bos, key, value, exp);
+                    } else {
+                        writeSetRecord(bos, key, value);
+                    }
                 }
                 bos.flush();
                 ch.force(false);
@@ -264,10 +356,33 @@ public class StorageEngine implements Closeable {
 
             LOG.info(String.format(
                 "[StorageEngine] compact complete — live keys=%d, walSize=%d bytes",
-                snapshot.size(), Files.size(walPath)));
+                snap.size(), Files.size(walPath)));
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Returns the remaining TTL in seconds for the given key, or -1 if the key
+     * has no TTL, or -2 if the key does not exist / is expired.
+     *
+     * @param key non-null, non-empty key
+     * @return TTL in seconds, -1 (no TTL), or -2 (key not found / expired)
+     */
+    public long ttl(String key) {
+        validateKey(key);
+        Long expiryMs = expiry.get(key);
+        if (expiryMs == null) {
+            // Check if key exists without a TTL.
+            lock.readLock().lock();
+            try {
+                return index.containsKey(key) ? -1L : -2L;
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+        long remaining = expiryMs - System.currentTimeMillis();
+        return remaining > 0 ? (remaining / 1_000L) : -2L;
     }
 
     /**
@@ -287,31 +402,42 @@ public class StorageEngine implements Closeable {
         return String.format(
             "=== StorageEngine Stats ===%n" +
             "  Live keys       : %d%n"      +
+            "  Keys with TTL   : %d%n"      +
             "  WAL file size   : %s%n"      +
             "  WAL path        : %s%n"      +
             "  SET  ops        : %d%n"      +
             "  GET  ops        : %d%n"      +
             "  DELETE ops      : %d%n"      +
             "  COMPACT ops     : %d%n"      +
+            "  Expired purged  : %d%n"      +
             "  Recovered keys  : %d%n"      +
             "===========================",
             index.size(),
+            expiry.size(),
             formatBytes(walSize),
             walPath.toAbsolutePath(),
             opSets.get(),
             opGets.get(),
             opDeletes.get(),
             opCompacts.get(),
+            opExpired.get(),
             recoveredKeys.get()
         );
     }
 
     /**
-     * Flushes any buffered WAL data and closes all file handles.
+     * Flushes any buffered WAL data, stops the TTL purger, and closes all file handles.
      * After this call the engine must not be used.
      */
     @Override
     public void close() throws IOException {
+        closed = true;
+        purger.shutdownNow();
+        try {
+            purger.awaitTermination(500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         lock.writeLock().lock();
         try {
             closeWal();
@@ -319,6 +445,81 @@ public class StorageEngine implements Closeable {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // TTL / expiry helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lazily evicts a single expired key by acquiring the write lock, writing a
+     * tombstone to the WAL, and removing from both maps. Safe to call concurrently;
+     * if the write lock cannot be acquired immediately (e.g., under heavy write
+     * contention) the eviction is skipped — the key will be caught by the next
+     * purger sweep.
+     */
+    private void evictExpired(String key) {
+        if (closed) return;
+        boolean locked = lock.writeLock().tryLock();
+        if (!locked) return;
+        try {
+            // Double-check: another thread may have already evicted this key.
+            Long exp = expiry.get(key);
+            if (exp == null || System.currentTimeMillis() <= exp) return;
+
+            try {
+                appendDelete(key);
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "[StorageEngine] Failed to write TTL tombstone for key=" + key, e);
+            }
+            index.remove(key);
+            expiry.remove(key);
+            opExpired.incrementAndGet();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Scheduled purger task — sweeps the expiry map and evicts all keys whose
+     * TTL has passed. Called on a virtual thread every {@value #PURGE_INTERVAL_MS} ms.
+     */
+    private void purgeExpiredKeys() {
+        if (closed) return;
+        long now = System.currentTimeMillis();
+        // Collect expired keys without holding the write lock first (avoids starvation).
+        List<String> expired = new ArrayList<>();
+        expiry.forEach((key, exp) -> {
+            if (now > exp) expired.add(key);
+        });
+        if (expired.isEmpty()) return;
+
+        lock.writeLock().lock();
+        try {
+            purgeExpiredKeysUnderLock();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Removes all currently-expired keys. Must be called while holding the write lock.
+     */
+    private void purgeExpiredKeysUnderLock() {
+        long now = System.currentTimeMillis();
+        expiry.forEach((key, exp) -> {
+            if (now > exp) {
+                try {
+                    appendDelete(key);
+                } catch (IOException e) {
+                    LOG.log(Level.WARNING,
+                        "[StorageEngine] Failed to write TTL tombstone for key=" + key, e);
+                }
+                index.remove(key);
+                expiry.remove(key);
+                opExpired.incrementAndGet();
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -348,9 +549,16 @@ public class StorageEngine implements Closeable {
         }
     }
 
-    /** Appends a SET record and syncs the WAL. */
+    /** Appends a SET record (no TTL) and syncs the WAL. */
     private void appendSet(String key, String value) throws IOException {
         writeSetRecord(walWriter, key, value);
+        walWriter.flush();
+        walChannel.force(false);
+    }
+
+    /** Appends a SET-with-expiry record and syncs the WAL. */
+    private void appendSetEx(String key, String value, long expiryMs) throws IOException {
+        writeSetExRecord(walWriter, key, value, expiryMs);
         walWriter.flush();
         walChannel.force(false);
     }
@@ -363,7 +571,7 @@ public class StorageEngine implements Closeable {
     }
 
     /**
-     * Writes a single SET record to the given stream.
+     * Writes a single SET record (no TTL) to the given stream.
      * Format: {@code S|<key-len>|<key>|<value-len>|<value>\n}
      */
     private static void writeSetRecord(OutputStream out, String key, String value)
@@ -372,6 +580,19 @@ public class StorageEngine implements Closeable {
         byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
         String record = OP_SET + "" + SEP + keyBytes.length + SEP +
                         key + SEP + valueBytes.length + SEP + value + LF;
+        out.write(record.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Writes a single SET-with-expiry record to the given stream.
+     * Format: {@code X|<key-len>|<key>|<value-len>|<value>|<expiry-epoch-ms>\n}
+     */
+    private static void writeSetExRecord(OutputStream out, String key, String value, long expiryMs)
+            throws IOException {
+        byte[] keyBytes   = key.getBytes(StandardCharsets.UTF_8);
+        byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
+        String record = OP_SET_EX + "" + SEP + keyBytes.length + SEP +
+                        key + SEP + valueBytes.length + SEP + value + SEP + expiryMs + LF;
         out.write(record.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -390,11 +611,12 @@ public class StorageEngine implements Closeable {
     // -------------------------------------------------------------------------
 
     /**
-     * Replays the WAL from disk to reconstruct the in-memory index.
+     * Replays the WAL from disk to reconstruct the in-memory index and expiry map.
      *
      * <p>The parser is length-prefix–driven, so it correctly handles keys and
      * values that contain pipe characters, newlines, or any other byte.
      * Partial trailing records (due to a crash mid-write) are silently skipped.
+     * Expired keys found during recovery are skipped (not loaded into the index).
      */
     private void recover() throws IOException {
         if (!Files.exists(walPath)) {
@@ -406,6 +628,7 @@ public class StorageEngine implements Closeable {
         long linesProcessed = 0;
         long linesCorrupted = 0;
         long keysRecovered  = 0;
+        long now = System.currentTimeMillis();
 
         try (InputStream fis  = Files.newInputStream(walPath);
              BufferedReader reader = new BufferedReader(
@@ -422,9 +645,23 @@ public class StorageEngine implements Closeable {
                     }
                     if (record.op() == OP_SET) {
                         index.put(record.key(), record.value());
+                        expiry.remove(record.key());
                         keysRecovered++;
+                    } else if (record.op() == OP_SET_EX) {
+                        long exp = record.expiryMs();
+                        if (now > exp) {
+                            // Already expired — skip loading; tombstone not needed
+                            // since compaction will exclude it on next run.
+                            index.remove(record.key());
+                            expiry.remove(record.key());
+                        } else {
+                            index.put(record.key(), record.value());
+                            expiry.put(record.key(), exp);
+                            keysRecovered++;
+                        }
                     } else if (record.op() == OP_DEL) {
                         index.remove(record.key());
+                        expiry.remove(record.key());
                         keysRecovered++;
                     } else {
                         linesCorrupted++;
@@ -455,8 +692,9 @@ public class StorageEngine implements Closeable {
 
         char op = line.charAt(0);
 
-        if (op == OP_SET) {
-            // Format: S|<keyLen>|<key>|<valLen>|<value>
+        if (op == OP_SET || op == OP_SET_EX) {
+            // Format (S): S|<keyLen>|<key>|<valLen>|<value>
+            // Format (X): X|<keyLen>|<key>|<valLen>|<value>|<expiryMs>
             int idx1 = line.indexOf(SEP, 2);
             if (idx1 < 0) return null;
             int keyLen;
@@ -484,7 +722,19 @@ public class StorageEngine implements Closeable {
             if (valEnd > line.length()) return null;
             String value = line.substring(valStart, valEnd);
 
-            return new WalRecord(OP_SET, key, value);
+            if (op == OP_SET) {
+                return new WalRecord(OP_SET, key, value, 0L);
+            }
+
+            // OP_SET_EX: remaining is "|<expiryMs>"
+            if (valEnd >= line.length() || line.charAt(valEnd) != SEP) return null;
+            long expiryMs;
+            try {
+                expiryMs = Long.parseLong(line.substring(valEnd + 1));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            return new WalRecord(OP_SET_EX, key, value, expiryMs);
 
         } else if (op == OP_DEL) {
             // Format: D|<keyLen>|<key>
@@ -501,7 +751,7 @@ public class StorageEngine implements Closeable {
             if (keyEnd > line.length()) return null;
             String key = line.substring(keyStart, keyEnd);
 
-            return new WalRecord(OP_DEL, key, null);
+            return new WalRecord(OP_DEL, key, null, 0L);
         }
 
         return null;
@@ -538,10 +788,22 @@ public class StorageEngine implements Closeable {
         return Collections.unmodifiableMap(new HashMap<>(index));
     }
 
+    /** Returns a read-only snapshot of the expiry map (for testing). */
+    Map<String, Long> expirySnapshot() {
+        return Collections.unmodifiableMap(new HashMap<>(expiry));
+    }
+
     // -------------------------------------------------------------------------
     // Internal record type
     // -------------------------------------------------------------------------
 
-    /** Parsed representation of a single WAL record. */
-    private record WalRecord(char op, String key, String value) {}
+    /**
+     * Parsed representation of a single WAL record.
+     *
+     * @param op        operation character: {@code S}, {@code X}, or {@code D}
+     * @param key       the key
+     * @param value     the value (null for DEL records)
+     * @param expiryMs  absolute expiry epoch millis (0 for non-TTL records)
+     */
+    private record WalRecord(char op, String key, String value, long expiryMs) {}
 }
