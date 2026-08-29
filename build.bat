@@ -91,9 +91,11 @@ REM ── Summary ────────────────────�
 echo.
 echo [build] Build complete ^-^> %OUT_DIR%\
 echo.
-echo   Run CLI :   java -cp %OUT_DIR% Main
-echo   Run tests:  java -cp %OUT_DIR% StorageEngineTest
-echo   Run server: java -cp %OUT_DIR% Main --server [--port 8080]
+echo   Run CLI       :  java -cp %OUT_DIR% Main
+echo   Run tests     :  java -cp %OUT_DIR% StorageEngineTest
+echo   Run server    :  java -cp %OUT_DIR% Main --server [--port 8080]
+echo   Run web server:  java -cp %OUT_DIR% Main --web [--web-port 8081]
+echo   Run both      :  java -cp %OUT_DIR% Main --server --web
 echo.
 
 endlocal

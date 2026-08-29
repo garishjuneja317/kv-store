@@ -91,13 +91,16 @@ public class Main {
     public static void main(String[] args) {
         // ── Argument parsing ──────────────────────────────────────────────────
         boolean serverMode = false;
+        boolean webMode    = false;
         int     port       = 8080;
+        int     webPort    = 8081;
         String  walArg     = "kv.wal";
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--server" -> serverMode = true;
-                case "--port"   -> {
+                case "--server"   -> serverMode = true;
+                case "--web"      -> webMode    = true;
+                case "--port"     -> {
                     if (i + 1 >= args.length) {
                         System.err.println(RED + "[ERROR] --port requires an integer argument." + RESET);
                         System.exit(1);
@@ -106,6 +109,18 @@ public class Main {
                         port = Integer.parseInt(args[++i]);
                     } catch (NumberFormatException e) {
                         System.err.println(RED + "[ERROR] Invalid port: " + args[i] + RESET);
+                        System.exit(1);
+                    }
+                }
+                case "--web-port" -> {
+                    if (i + 1 >= args.length) {
+                        System.err.println(RED + "[ERROR] --web-port requires an integer argument." + RESET);
+                        System.exit(1);
+                    }
+                    try {
+                        webPort = Integer.parseInt(args[++i]);
+                    } catch (NumberFormatException e) {
+                        System.err.println(RED + "[ERROR] Invalid web-port: " + args[i] + RESET);
                         System.exit(1);
                     }
                 }
@@ -135,19 +150,36 @@ public class Main {
             try { engine.close(); } catch (IOException ignored) {}
         }, "kv-shutdown-hook"));
 
-        // ── Dispatch to server or CLI ─────────────────────────────────────────
-        if (serverMode) {
-            runServer(engine, port);
-        } else {
+        // ── Dispatch to server / web / CLI ───────────────────────────────────
+        if (!serverMode && !webMode) {
+            // Interactive CLI — runs until the user types EXIT.
             runCli(engine);
+            return;
+        }
+
+        // One or both server modes. Start each in turn (both are non-blocking).
+        if (serverMode) {
+            startTcpServer(engine, port);
+        }
+        if (webMode) {
+            startWebServer(engine, webPort);
+        }
+
+        // Block the main thread. The JVM shutdown hook closes the engine.
+        System.out.println(GREY + "  Press Ctrl-C to stop." + RESET + "\n");
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
     // -------------------------------------------------------------------------
-    // Server mode
+    // Server mode helpers
     // -------------------------------------------------------------------------
 
-    private static void runServer(StorageEngine engine, int port) {
+    /** Starts the TCP server (non-blocking). Prints the connection banner. */
+    private static void startTcpServer(StorageEngine engine, int port) {
         NetworkServer server = new NetworkServer(engine, port);
         try {
             server.start();
@@ -157,18 +189,23 @@ public class Main {
             System.exit(1);
             return;
         }
-
         System.out.println(BLUE + BOLD + "  ► TCP server listening on port " + port + RESET);
         System.out.println(GREY  + "  Connect with: telnet localhost " + port + RESET);
-        System.out.println(GREY  + "  Press Ctrl-C to stop." + RESET + "\n");
+    }
 
-        // Block the main thread until the JVM is asked to shut down.
-        // The shutdown hook will close the engine; we just need to wait.
+    /** Starts the HTTP web server (non-blocking). Prints the URL banner. */
+    private static void startWebServer(StorageEngine engine, int port) {
+        WebServer web = new WebServer(engine, port);
         try {
-            Thread.currentThread().join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            web.start();
+        } catch (IOException e) {
+            System.err.println(RED + "[ERROR] Failed to bind HTTP server on port " + port +
+                ": " + e.getMessage() + RESET);
+            System.exit(1);
+            return;
         }
+        System.out.println(MAGENTA + BOLD + "  ► Web dashboard on http://localhost:" + port + RESET);
+        System.out.println(GREY + "  API base: http://localhost:" + port + "/api/" + RESET);
     }
 
     // -------------------------------------------------------------------------
