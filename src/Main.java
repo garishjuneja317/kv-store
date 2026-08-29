@@ -8,23 +8,31 @@ import java.util.Scanner;
  *
  * <h2>Modes of Operation</h2>
  * <pre>
- *   java Main                        Interactive CLI (default)
- *   java Main /path/to/db.wal        CLI with custom WAL path
- *   java Main --server               TCP server on port 8080
- *   java Main --server --port 9090   TCP server on port 9090
- *   java Main --server /path/db.wal  TCP server with custom WAL path
+ *   java Main                                  Interactive CLI (default)
+ *   java Main /path/to/db.wal                  CLI with custom WAL path
+ *   java Main --server                         TCP server on port 8080
+ *   java Main --server --port 9090             TCP server on port 9090
+ *   java Main --web                            HTTP dashboard on port 8081
+ *   java Main --server --web                   Both servers, shared engine
+ *   java Main --server --requirepass secret    TCP server with auth
+ *   java Main --web   --requirepass secret     HTTP server with Bearer auth
  * </pre>
  *
  * <h2>Supported CLI Commands</h2>
  * <pre>
- *   SET    &lt;key&gt; &lt;value&gt; [EX &lt;seconds&gt;]  Store a value with optional TTL
- *   GET    &lt;key&gt;                            Retrieve a value
- *   DELETE &lt;key&gt;                            Remove a key (tombstone written to WAL)
- *   TTL    &lt;key&gt;                            Show remaining seconds for a key (-1 = no TTL)
- *   COMPACT                                 Rewrite the WAL, eliminating stale entries
- *   STATS                                   Print live telemetry and disk usage
- *   HELP                                    Display this help text
- *   EXIT                                    Flush, close the engine, and quit
+ *   SET      &lt;key&gt; &lt;value&gt; [EX &lt;seconds&gt;]  Store a value with optional TTL
+ *   GET      &lt;key&gt;                            Retrieve a string value
+ *   DELETE   &lt;key&gt;                            Remove a key (any type)
+ *   TTL      &lt;key&gt;                            Show remaining seconds (-1=no TTL)
+ *   TYPE     &lt;key&gt;                            Show value type (string/list/set/none)
+ *   LPUSH    &lt;key&gt; &lt;element&gt;                  Prepend element to a list
+ *   LRANGE   &lt;key&gt; &lt;start&gt; &lt;end&gt;             Get list slice (0-indexed, -1=last)
+ *   SADD     &lt;key&gt; &lt;member&gt;                   Add member to a set
+ *   SMEMBERS &lt;key&gt;                            Get all set members
+ *   COMPACT                                  Rewrite the WAL, eliminating stale entries
+ *   STATS                                    Print live telemetry and disk usage
+ *   HELP                                     Display this help text
+ *   EXIT                                     Flush, close the engine, and quit
  * </pre>
  *
  * <h2>Design Notes</h2>
@@ -74,15 +82,19 @@ public class Main {
 
     private static final String HELP_TEXT =
         BOLD + "\nAvailable Commands\n" + RESET +
-        "  " + CYAN + "SET    <key> <value> [EX <seconds>]" + RESET +
-            "  — store a key-value pair with optional TTL\n" +
-        "  " + CYAN + "GET    <key>"          + RESET + "                        — retrieve the value for a key\n" +
-        "  " + CYAN + "DELETE <key>"          + RESET + "                        — remove a key (writes tombstone to WAL)\n" +
-        "  " + CYAN + "TTL    <key>"          + RESET + "                        — show remaining TTL in seconds (-1=no TTL, -2=not found)\n" +
-        "  " + CYAN + "COMPACT"               + RESET + "                             — rewrite WAL, eliminating stale/expired entries\n" +
-        "  " + CYAN + "STATS"                 + RESET + "                               — show telemetry and disk usage\n" +
-        "  " + CYAN + "HELP"                  + RESET + "                                — display this message\n" +
-        "  " + CYAN + "EXIT"                  + RESET + "                                — save and quit\n";
+        "  " + CYAN + "SET      <key> <value> [EX <seconds>]" + RESET + "  — store a string with optional TTL\n" +
+        "  " + CYAN + "GET      <key>"         + RESET + "                         — retrieve a string value\n" +
+        "  " + CYAN + "DELETE   <key>"         + RESET + "                         — remove a key (any type)\n" +
+        "  " + CYAN + "TTL      <key>"         + RESET + "                         — remaining TTL (-1=no TTL, -2=missing)\n" +
+        "  " + CYAN + "TYPE     <key>"         + RESET + "                         — returns: string | list | set | none\n" +
+        "  " + CYAN + "LPUSH    <key> <element>" + RESET + "                — prepend element to a list\n" +
+        "  " + CYAN + "LRANGE   <key> <start> <end>" + RESET + "            — get list slice (0-indexed, -1=last)\n" +
+        "  " + CYAN + "SADD     <key> <member>" + RESET + "                  — add member to a set\n" +
+        "  " + CYAN + "SMEMBERS <key>"         + RESET + "                         — get all set members\n" +
+        "  " + CYAN + "COMPACT" + RESET + "                                       — rewrite WAL, eliminate stale entries\n" +
+        "  " + CYAN + "STATS"   + RESET + "                                         — show telemetry and disk usage\n" +
+        "  " + CYAN + "HELP"    + RESET + "                                          — display this message\n" +
+        "  " + CYAN + "EXIT"    + RESET + "                                          — save and quit\n";
 
     // -------------------------------------------------------------------------
     // Entry point
@@ -95,40 +107,43 @@ public class Main {
         int     port       = 8080;
         int     webPort    = 8081;
         String  walArg     = "kv.wal";
+        String  password   = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--server"   -> serverMode = true;
-                case "--web"      -> webMode    = true;
-                case "--port"     -> {
+                case "--server"      -> serverMode = true;
+                case "--web"         -> webMode    = true;
+                case "--port"        -> {
                     if (i + 1 >= args.length) {
                         System.err.println(RED + "[ERROR] --port requires an integer argument." + RESET);
                         System.exit(1);
                     }
-                    try {
-                        port = Integer.parseInt(args[++i]);
-                    } catch (NumberFormatException e) {
+                    try { port = Integer.parseInt(args[++i]); }
+                    catch (NumberFormatException e) {
                         System.err.println(RED + "[ERROR] Invalid port: " + args[i] + RESET);
                         System.exit(1);
                     }
                 }
-                case "--web-port" -> {
+                case "--web-port"    -> {
                     if (i + 1 >= args.length) {
                         System.err.println(RED + "[ERROR] --web-port requires an integer argument." + RESET);
                         System.exit(1);
                     }
-                    try {
-                        webPort = Integer.parseInt(args[++i]);
-                    } catch (NumberFormatException e) {
+                    try { webPort = Integer.parseInt(args[++i]); }
+                    catch (NumberFormatException e) {
                         System.err.println(RED + "[ERROR] Invalid web-port: " + args[i] + RESET);
                         System.exit(1);
                     }
                 }
-                default -> {
-                    // Any non-flag argument is treated as the WAL path.
-                    if (!args[i].startsWith("--")) {
-                        walArg = args[i];
+                case "--requirepass" -> {
+                    if (i + 1 >= args.length) {
+                        System.err.println(RED + "[ERROR] --requirepass requires a password argument." + RESET);
+                        System.exit(1);
                     }
+                    password = args[++i];
+                }
+                default -> {
+                    if (!args[i].startsWith("--")) walArg = args[i];
                 }
             }
         }
@@ -152,26 +167,16 @@ public class Main {
 
         // ── Dispatch to server / web / CLI ───────────────────────────────────
         if (!serverMode && !webMode) {
-            // Interactive CLI — runs until the user types EXIT.
             runCli(engine);
             return;
         }
-
-        // One or both server modes. Start each in turn (both are non-blocking).
-        if (serverMode) {
-            startTcpServer(engine, port);
-        }
-        if (webMode) {
-            startWebServer(engine, webPort);
-        }
+        if (serverMode) startTcpServer(engine, port, password);
+        if (webMode)    startWebServer(engine, webPort, password);
 
         // Block the main thread. The JVM shutdown hook closes the engine.
         System.out.println(GREY + "  Press Ctrl-C to stop." + RESET + "\n");
-        try {
-            Thread.currentThread().join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.currentThread().join(); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     // -------------------------------------------------------------------------
@@ -179,8 +184,8 @@ public class Main {
     // -------------------------------------------------------------------------
 
     /** Starts the TCP server (non-blocking). Prints the connection banner. */
-    private static void startTcpServer(StorageEngine engine, int port) {
-        NetworkServer server = new NetworkServer(engine, port);
+    private static void startTcpServer(StorageEngine engine, int port, String password) {
+        NetworkServer server = new NetworkServer(engine, port, password);
         try {
             server.start();
         } catch (IOException e) {
@@ -191,11 +196,12 @@ public class Main {
         }
         System.out.println(BLUE + BOLD + "  ► TCP server listening on port " + port + RESET);
         System.out.println(GREY  + "  Connect with: telnet localhost " + port + RESET);
+        if (password != null) System.out.println(YELLOW + "  Auth required: AUTH <password>" + RESET);
     }
 
     /** Starts the HTTP web server (non-blocking). Prints the URL banner. */
-    private static void startWebServer(StorageEngine engine, int port) {
-        WebServer web = new WebServer(engine, port);
+    private static void startWebServer(StorageEngine engine, int port, String password) {
+        WebServer web = new WebServer(engine, port, password);
         try {
             web.start();
         } catch (IOException e) {
@@ -206,6 +212,7 @@ public class Main {
         }
         System.out.println(MAGENTA + BOLD + "  ► Web dashboard on http://localhost:" + port + RESET);
         System.out.println(GREY + "  API base: http://localhost:" + port + "/api/" + RESET);
+        if (password != null) System.out.println(YELLOW + "  Auth required: Authorization: Bearer <password>" + RESET);
     }
 
     // -------------------------------------------------------------------------
@@ -217,18 +224,10 @@ public class Main {
             while (true) {
                 System.out.print(BOLD + CYAN + "kv> " + RESET);
                 System.out.flush();
-
-                if (!scanner.hasNextLine()) {
-                    // EOF (e.g., piped input exhausted).
-                    break;
-                }
-
+                if (!scanner.hasNextLine()) break;
                 String rawLine = scanner.nextLine().trim();
-                if (rawLine.isEmpty()) {
-                    continue;
-                }
+                if (rawLine.isEmpty()) continue;
 
-                // Parse command — split on the first whitespace boundary.
                 String[] parts   = rawLine.split("\\s+", 2);
                 String   command = parts[0].toUpperCase();
                 String   rest    = (parts.length > 1) ? parts[1] : "";
@@ -239,6 +238,11 @@ public class Main {
                         case "GET"               -> handleGet(engine, rest);
                         case "DELETE", "DEL"     -> handleDelete(engine, rest);
                         case "TTL"               -> handleTtl(engine, rest);
+                        case "TYPE"              -> handleType(engine, rest);
+                        case "LPUSH"             -> handleLpush(engine, rest);
+                        case "LRANGE"            -> handleLrange(engine, rest);
+                        case "SADD"              -> handleSadd(engine, rest);
+                        case "SMEMBERS"          -> handleSmembers(engine, rest);
                         case "COMPACT"           -> handleCompact(engine);
                         case "STATS"             -> handleStats(engine);
                         case "HELP"              -> System.out.println(HELP_TEXT);
@@ -252,7 +256,7 @@ public class Main {
                             YELLOW + "[WARN] Unknown command: " + BOLD + command +
                             RESET + YELLOW + ". Type HELP for usage." + RESET);
                     }
-                } catch (IllegalArgumentException e) {
+                } catch (IllegalArgumentException | IllegalStateException e) {
                     System.out.println(RED + "[ERROR] " + e.getMessage() + RESET);
                 } catch (IOException e) {
                     System.out.println(RED + "[ERROR] I/O failure: " + e.getMessage() + RESET);
@@ -375,9 +379,64 @@ public class Main {
         }
     }
 
-    /**
-     * Handles: COMPACT
-     */
+    /** Handles: TYPE &lt;key&gt; */
+    private static void handleType(StorageEngine engine, String rest) {
+        String key = rest.trim();
+        if (key.isEmpty()) throw new IllegalArgumentException("Usage: TYPE <key>");
+        String t = engine.type(key);
+        System.out.println(CYAN + t + RESET + GREY + "  — type of key: " + key + RESET);
+    }
+
+    /** Handles: LPUSH &lt;key&gt; &lt;element&gt; */
+    private static void handleLpush(StorageEngine engine, String rest) throws IOException {
+        String[] kv = rest.split("\\s+", 2);
+        if (kv.length < 2 || kv[1].isBlank())
+            throw new IllegalArgumentException("Usage: LPUSH <key> <element>");
+        int len = engine.lpush(kv[0], kv[1]);
+        System.out.println(GREEN + "(integer) " + len + RESET +
+            GREY + "  — list length after push" + RESET);
+    }
+
+    /** Handles: LRANGE &lt;key&gt; &lt;start&gt; &lt;end&gt; */
+    private static void handleLrange(StorageEngine engine, String rest) {
+        String[] parts = rest.split("\\s+", 3);
+        if (parts.length < 3) throw new IllegalArgumentException("Usage: LRANGE <key> <start> <end>");
+        int start, end;
+        try { start = Integer.parseInt(parts[1]); end = Integer.parseInt(parts[2]); }
+        catch (NumberFormatException e) {
+            throw new IllegalArgumentException("LRANGE start/end must be integers."); }
+        java.util.List<String> elems = engine.lrange(parts[0], start, end);
+        if (elems.isEmpty()) { System.out.println(GREY + "(empty list)" + RESET); return; }
+        for (int i = 0; i < elems.size(); i++) {
+            System.out.println(GREY + (i + 1) + ") " + RESET +
+                GREEN + "\"" + elems.get(i) + "\"" + RESET);
+        }
+    }
+
+    /** Handles: SADD &lt;key&gt; &lt;member&gt; */
+    private static void handleSadd(StorageEngine engine, String rest) throws IOException {
+        String[] kv = rest.split("\\s+", 2);
+        if (kv.length < 2 || kv[1].isBlank())
+            throw new IllegalArgumentException("Usage: SADD <key> <member>");
+        boolean added = engine.sadd(kv[0], kv[1]);
+        System.out.println(GREEN + "(integer) " + (added ? 1 : 0) + RESET +
+            GREY + "  — " + (added ? "member added" : "already a member") + RESET);
+    }
+
+    /** Handles: SMEMBERS &lt;key&gt; */
+    private static void handleSmembers(StorageEngine engine, String rest) {
+        String key = rest.trim();
+        if (key.isEmpty()) throw new IllegalArgumentException("Usage: SMEMBERS <key>");
+        java.util.Set<String> members = engine.smembers(key);
+        if (members.isEmpty()) { System.out.println(GREY + "(empty set)" + RESET); return; }
+        int i = 1;
+        for (String m : new java.util.TreeSet<>(members)) {
+            System.out.println(GREY + (i++) + ") " + RESET +
+                GREEN + "\"" + m + "\"" + RESET);
+        }
+    }
+
+    /** Handles: COMPACT */
     private static void handleCompact(StorageEngine engine) throws IOException {
         System.out.println(GREY + "Running compaction…" + RESET);
         long before = System.currentTimeMillis();

@@ -1,7 +1,7 @@
 # KV-Store
 
 > **A crash-safe, WAL-backed embedded Key-Value Store in pure Java 25.**  
-> Zero third-party dependencies · O(1) reads · Concurrent read/write · Atomic compaction · Key expiration (TTL) · TCP server · HTTP dashboard
+> Zero third-party dependencies · O(1) reads · Concurrent read/write · Atomic compaction · Key expiration (TTL) · TCP server · HTTP dashboard · Multi-type values · Per-connection auth
 
 ---
 
@@ -16,6 +16,10 @@ KV-Store is a self-contained, embeddable key-value database implemented entirely
 
 **Phase 3 additions:**
 - **HTTP Web UI** — `--web` flag launches a REST API server on port 8081 with an embedded SPA dashboard.
+
+**Phase 4 additions:**
+- **Advanced Data Structures** — Lists (`LPUSH`, `LRANGE`) and Sets (`SADD`, `SMEMBERS`) backed by `CopyOnWriteArrayList` and `ConcurrentHashMap.newKeySet()`. WAL records types `L` and `A` serialize these operations.
+- **Per-connection Authentication** — `--requirepass <password>` enforces `AUTH <password>` on every new TCP connection and `Authorization: Bearer <password>` on every HTTP `/api/` request.
 
 ---
 
@@ -258,11 +262,16 @@ curl http://localhost:8081/api/stats
 
 | Command | Description |
 |---|---|
-| `SET <key> <value>` | Store a value. Values may contain spaces. |
-| `SET <key> <value> EX <seconds>` | Store a value with a time-to-live. |
-| `GET <key>` | Retrieve a value. Prints `(nil)` if not found or expired. |
-| `DELETE <key>` | Remove a key. Writes a tombstone to the WAL. |
+| `SET <key> <value>` | Store a string value. Values may contain spaces. |
+| `SET <key> <value> EX <seconds>` | Store a string value with a time-to-live. |
+| `GET <key>` | Retrieve a string value. Prints `(nil)` if not found, expired, or wrong type. |
+| `DELETE <key>` | Remove a key of any type. Writes a tombstone to the WAL. |
 | `TTL <key>` | Show remaining TTL in seconds (`-1` = no TTL, `-2` = not found). |
+| `TYPE <key>` | Show the type of a key: `string`, `list`, `set`, or `none`. |
+| `LPUSH <key> <element>` | Prepend one element to a list. Creates the list if absent. |
+| `LRANGE <key> <start> <end>` | Return a slice of a list. `0 -1` returns all elements. |
+| `SADD <key> <member>` | Add one member to a set. Creates the set if absent. |
+| `SMEMBERS <key>` | Return all members of a set (sorted alphabetically). |
 | `COMPACT` | Rewrite the WAL, eliminating stale and expired entries. |
 | `STATS` | Print live telemetry and WAL disk usage. |
 | `HELP` | Display the command reference. |
@@ -288,6 +297,51 @@ kv> TTL session
 -2  — key not found or expired
 ```
 
+### List Examples
+
+```
+kv> LPUSH log entry-one
+(integer) 1  — list length after push
+
+kv> LPUSH log entry-two
+(integer) 2  — list length after push
+
+kv> LPUSH log entry-three
+(integer) 3  — list length after push
+
+kv> LRANGE log 0 -1
+1) "entry-three"
+2) "entry-two"
+3) "entry-one"
+
+kv> LRANGE log 0 1
+1) "entry-three"
+2) "entry-two"
+
+kv> TYPE log
+list  — type of key: log
+```
+
+### Set Examples
+
+```
+kv> SADD tags java
+(integer) 1  — member added
+
+kv> SADD tags golang
+(integer) 1  — member added
+
+kv> SADD tags java
+(integer) 0  — already a member
+
+kv> SMEMBERS tags
+1) "golang"
+2) "java"
+
+kv> TYPE tags
+set  — type of key: tags
+```
+
 ---
 
 ## TCP Server Protocol
@@ -298,33 +352,99 @@ The server uses a plain-text, newline-delimited protocol identical to the CLI.
 
 | Request | Response |
 |---|---|
+| `AUTH <password>` | `OK` or `ERROR invalid password` |
 | `SET key value [EX n]` | `OK` or `OK (TTL=Ns)` |
 | `GET key` | `"value"` or `(nil)` |
 | `DELETE key` | `DELETED key` |
 | `TTL key` | integer or `-1`/`-2` with description |
+| `TYPE key` | `string`, `list`, `set`, or `none` |
+| `LPUSH key element` | `(integer) <new-length>` |
+| `LRANGE key start end` | numbered list reply |
+| `SADD key member` | `(integer) 1` (added) or `(integer) 0` (duplicate) |
+| `SMEMBERS key` | numbered sorted list |
 | `COMPACT` | `COMPACT OK (N ms)` |
 | `STATS` | multi-line stats block |
 | `HELP` | command reference |
-| `QUIT` | `BYE` (server closes connection) |
+| `QUIT` | `BYE` (connection closed) |
 
 ### Example Session
 
 ```
 $ nc localhost 8080
-KV-STORE ready. Type HELP for commands.
+KV-STORE ready. Authentication required — send: AUTH <password>
+AUTH mypassword
+OK
 SET username Garish EX 300
 OK (TTL=300s)
 GET username
 "Garish"
-TTL username
-299
-COMPACT
-COMPACT OK (5 ms)
+LPUSH tags java
+(integer) 1
+LPUSH tags golang
+(integer) 2
+SMEMBERS tags       <- wrong type example
+ERROR WRONGTYPE operation against a key holding the wrong kind of value
+SADD langs java
+(integer) 1
+SMEMBERS langs
+1) "java"
 QUIT
 BYE
 ```
 
-### Concurrency Model (Server)
+---
+
+## Authentication
+
+### `--requirepass`
+
+Both the TCP server and the HTTP web server share the same password, configured with a single flag:
+
+```bash
+# TCP only
+java -cp out Main --server --requirepass mypassword
+
+# HTTP only
+java -cp out Main --web --requirepass mypassword
+
+# Both simultaneously
+java -cp out Main --server --web --requirepass mypassword
+```
+
+### TCP: `AUTH <password>`
+
+When a password is configured, new TCP connections start unauthenticated:
+
+```
+$ telnet localhost 8080
+KV-STORE ready. Authentication required — send: AUTH <password>
+GET foo
+NOAUTH Authentication required. Please authenticate with: AUTH <password>
+AUTH wrongpassword
+ERROR invalid password
+AUTH mypassword
+OK
+GET foo
+(nil)
+```
+
+`AUTH` and `QUIT` are always processed regardless of authentication state. All other commands return `NOAUTH` until the session is authenticated. If no password is configured, all connections are pre-authenticated.
+
+### HTTP: `Authorization: Bearer <password>`
+
+All `/api/` endpoints require a valid `Authorization` header:
+
+```bash
+# Without auth header → 401
+curl http://localhost:8081/api/stats
+# → {"ok":false,"error":"Unauthorized — provide Authorization: Bearer <password>"}
+
+# With auth header → 200
+curl -H 'Authorization: Bearer mypassword' http://localhost:8081/api/stats
+# → {"Live keys":"0",...}
+```
+
+The embedded SPA automatically detects 401 responses and shows a password-entry modal. The entered password is stored in a JavaScript variable and appended to all subsequent `fetch()` calls as a `Bearer` token.
 
 Each TCP connection is handled in its own **Java virtual thread**. There is no fixed thread pool limit — the server can sustain thousands of simultaneous connections. All commands route through the same `StorageEngine` instance, which is internally guarded by a `ReentrantReadWriteLock`.
 
@@ -352,10 +472,16 @@ KV-Store uses a **hybrid expiration strategy**:
 Expired keys are persisted in the WAL with a new record type `X`:
 
 ```
-X|<key-byte-len>|<key>|<val-byte-len>|<value>|<expiry-epoch-ms>
+S|<key-byte-len>|<key>|<val-byte-len>|<value>          (SET, no TTL)
+X|<key-byte-len>|<key>|<val-byte-len>|<value>|<expiry> (SET with TTL)
+D|<key-byte-len>|<key>                                  (DELETE / tombstone)
+L|<key-byte-len>|<key>|<elem-byte-len>|<element>        (LPUSH — prepend to list)
+A|<key-byte-len>|<key>|<elem-byte-len>|<member>         (SADD  — add to set)
 ```
 
-This is **backward-compatible**: old WAL files with only `S` and `D` records continue to replay correctly. During recovery, `X` records whose expiry timestamp has already passed are silently skipped (not loaded into the index).
+All record types share the same length-prefix field format. The parser is generic and handles all five types. Old WAL files with only `S`, `X`, and `D` records are fully replay-compatible.
+
+During compaction, list keys are written tail-to-head so that sequential `L` (LPUSH) replays reconstruct the correct front-first ordering. Set keys are written as one `A` record per member (order is arbitrary, since sets are unordered).
 
 ### TTL and Compaction
 
